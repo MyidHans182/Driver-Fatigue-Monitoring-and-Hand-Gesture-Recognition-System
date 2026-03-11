@@ -52,6 +52,7 @@ def Start():
             hand_count = hands[0]
             fingers = handDetector.fingersUp(hand_count)
             count = fingers.count(1)
+            
             cvzone.putTextRect(img, f'Finger: {count}', (0, 50), scale=2, thickness=2, colorR=color)
 
             if count == 1:
