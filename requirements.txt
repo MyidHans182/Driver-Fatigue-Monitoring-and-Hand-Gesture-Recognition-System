@@ -2,3 +2,5 @@ opencv-python
 mediapipe
 cvzone
 Pillow
+pygame
+numpy
