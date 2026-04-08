@@ -8,18 +8,15 @@ driving_simulation.py  –  Mô phỏng lái xe với vehicle model.
 import pygame
 import math
 import random
-import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # ── Cấu hình ──
 SCREEN_W, SCREEN_H = 900, 650
 FPS = 60
 ROAD_W = 320
-LANE_W = ROAD_W // 3
 
 # Màu sắc
 SKY           = (135, 206, 235)
-SKY_DARK      = (40, 40, 80)
 GRASS         = (34, 139, 34)
 ROAD_COLOR    = (60, 60, 60)
 LINE_WHITE    = (255, 255, 255)
@@ -29,27 +26,28 @@ CAR_WINDOW    = (180, 220, 255)
 ALERT_RED     = (220, 30, 30)
 ALERT_YELLOW  = (255, 200, 0)
 ALERT_GREEN   = (0, 200, 80)
-BRAKE_RED     = (255, 0, 0)
 HAZARD_ORANGE = (255, 140, 0)
-HUD_BG        = (20, 20, 30)
 GAUGE_BG      = (40, 40, 50)
+
+# Chu kỳ nét đứt đường (pixels)
+DASH_CYCLE = 40
 
 
 # ── VehicleState ──
 @dataclass
 class VehicleState:
     """Trạng thái xe – dùng để tích hợp mô hình xe thực."""
-    speed: float = 0.0              # km/h hiện tại
-    max_speed: float = 80.0         # tốc độ tối đa
-    target_speed: float = 80.0      # tốc độ mục tiêu
-    steering_angle: float = 0.0     # góc lái (-1.0 đến 1.0)
-    brake_force: float = 0.0        # lực phanh (0-1)
-    throttle: float = 1.0           # ga (0-1)
-    lane_offset: float = 0.0        # độ lệch lane (pixels)
-    is_emergency: bool = False      # chế độ khẩn cấp
-    hazard_on: bool = False         # đèn hazard
-    brake_light: bool = False       # đèn phanh
-    lane_departure: bool = False    # cảnh báo lệch làn
+    speed: float = 0.0
+    max_speed: float = 80.0
+    target_speed: float = 80.0
+    steering_angle: float = 0.0
+    brake_force: float = 0.0
+    throttle: float = 1.0
+    lane_offset: float = 0.0
+    is_emergency: bool = False
+    hazard_on: bool = False
+    brake_light: bool = False
+    lane_departure: bool = False
 
     def to_dict(self):
         """Export trạng thái xe dưới dạng dict (cho logging/CAN bus)."""
@@ -74,8 +72,7 @@ class TrafficCar:
     y: float = 0.0
     speed: float = 60.0
     color: tuple = (180, 30, 30)
-    lane: int = 0  # -1 = trái, 0 = giữa, 1 = phải
-    active: bool = True
+    lane: int = 0  # -1 = trái, 1 = phải
 
 
 class DrivingSimulation:
@@ -155,7 +152,6 @@ class DrivingSimulation:
         v = self.vehicle
 
         if not self.is_monitoring:
-            # Không monitoring → xe chạy bình thường
             v.target_speed = v.max_speed
             v.brake_force = 0.0
             v.throttle = 1.0
@@ -163,7 +159,6 @@ class DrivingSimulation:
             v.hazard_on = False
             v.brake_light = False
         elif score > 80:
-            # Bình thường
             v.target_speed = v.max_speed
             v.brake_force = 0.0
             v.throttle = 1.0
@@ -171,7 +166,6 @@ class DrivingSimulation:
             v.hazard_on = False
             v.brake_light = False
         elif score > 60:
-            # Cảnh báo nhẹ - giảm 10%
             v.target_speed = v.max_speed * 0.9
             v.brake_force = 0.1
             v.throttle = 0.8
@@ -179,7 +173,6 @@ class DrivingSimulation:
             v.hazard_on = False
             v.brake_light = True
         elif score > 40:
-            # Cảnh báo nặng - giảm 30%, hazard
             v.target_speed = v.max_speed * 0.7
             v.brake_force = 0.3
             v.throttle = 0.5
@@ -187,7 +180,6 @@ class DrivingSimulation:
             v.hazard_on = True
             v.brake_light = True
         elif score > 20:
-            # Emergency - phanh từ từ, hazard
             v.target_speed = v.max_speed * 0.3
             v.brake_force = 0.6
             v.throttle = 0.0
@@ -195,7 +187,6 @@ class DrivingSimulation:
             v.hazard_on = True
             v.brake_light = True
         else:
-            # Emergency brake - dừng xe
             v.target_speed = 0
             v.brake_force = 1.0
             v.throttle = 0.0
@@ -206,9 +197,9 @@ class DrivingSimulation:
         # Smooth speed transition
         speed_diff = v.target_speed - v.speed
         if abs(speed_diff) > 0.5:
-            accel = 0.3 if speed_diff > 0 else -0.8  # phanh nhanh hơn tăng tốc
+            accel = 0.3 if speed_diff > 0 else -0.8
             if v.brake_force > 0.5:
-                accel = -1.5  # emergency brake
+                accel = -1.5
             v.speed += accel
         v.speed = max(0, min(v.speed, v.max_speed))
 
@@ -218,7 +209,6 @@ class DrivingSimulation:
 
     def _update_drift(self):
         """Xe lệch lane dựa trên mức buồn ngủ + head yaw."""
-        # Head yaw ảnh hưởng drift
         head_drift = self.head_yaw * 0.5 if self.is_monitoring else 0
 
         if self.drowsy_level >= 2:
@@ -232,18 +222,15 @@ class DrivingSimulation:
                 self.drift_target = random.uniform(-50, 50) + head_drift
             self.drift_speed = 0.8
         else:
-            # Bình thường → trở về center (lane keep assist)
             self.drift_target = head_drift * 0.2
             self.drift_speed = 2.5
             self.swerve_timer = 0
 
-        # Smooth drift
         diff = self.drift_target - self.drift
         if abs(diff) > 0.3:
             self.drift += diff * 0.025 * self.drift_speed
         self.car_screen_x = SCREEN_W // 2 + self.drift
 
-        # Steering angle cho vehicle state
         self.vehicle.steering_angle = max(-1, min(1, self.drift / 120.0))
 
     def _update_traffic(self):
@@ -251,7 +238,9 @@ class DrivingSimulation:
         self.traffic_spawn_timer += 1
         if self.traffic_spawn_timer > 180 and len(self.traffic) < 3:
             lane = random.choice([-1, 1])
-            color = random.choice([(180, 30, 30), (30, 130, 30), (160, 160, 30), (200, 200, 200)])
+            color = random.choice([
+                (180, 30, 30), (30, 130, 30), (160, 160, 30), (200, 200, 200)
+            ])
             car = TrafficCar(
                 x=SCREEN_W // 2 + lane * 80,
                 y=SCREEN_H // 3 - 20,
@@ -262,66 +251,80 @@ class DrivingSimulation:
             self.traffic.append(car)
             self.traffic_spawn_timer = 0
 
-        # Update position - traffic comes towards player
+        vanish_y = SCREEN_H // 3
+        road_h = SCREEN_H - vanish_y
         for car in self.traffic:
             relative_speed = self.vehicle.speed - car.speed
             car.y += relative_speed * 0.05 + 1.5
-            # Perspective scaling
-            t = max(0, (car.y - SCREEN_H // 3)) / (SCREEN_H - SCREEN_H // 3)
+            t = max(0, (car.y - vanish_y)) / road_h
             car.x = SCREEN_W // 2 + car.lane * (30 + 60 * t) + self.drift * t * 0.3
 
-        # Remove off-screen
         self.traffic = [c for c in self.traffic if c.y < SCREEN_H + 50]
 
     # ── Drawing ──
     def _draw_road(self):
-        """Vẽ đường với perspective."""
+        """Vẽ đường với perspective – polygon cho thân đường, loop chỉ cho vạch."""
         self.screen.fill(SKY)
-
-        # Cỏ
-        pygame.draw.rect(self.screen, GRASS, (0, SCREEN_H // 3, SCREEN_W, SCREEN_H))
 
         vanish_y = SCREEN_H // 3
         road_top_w = 60
         road_bot_w = ROAD_W
 
-        for y in range(vanish_y, SCREEN_H):
+        # Cỏ (1 rect)
+        pygame.draw.rect(self.screen, GRASS, (0, vanish_y, SCREEN_W, SCREEN_H - vanish_y))
+
+        # Đường chính – 1 polygon thay vì pixel-by-pixel
+        cx_top = SCREEN_W // 2 + self.drift * 0.0  # vanishing point không drift
+        cx_bot = SCREEN_W // 2 + self.drift * 0.3
+        road_poly = [
+            (int(cx_top - road_top_w), vanish_y),
+            (int(cx_top + road_top_w), vanish_y),
+            (int(cx_bot + road_bot_w), SCREEN_H),
+            (int(cx_bot - road_bot_w), SCREEN_H),
+        ]
+        pygame.draw.polygon(self.screen, ROAD_COLOR, road_poly)
+
+        # Vạch lề trái + phải (2 polylines)
+        edge_pts_left = []
+        edge_pts_right = []
+        for y in range(vanish_y, SCREEN_H, 4):  # mỗi 4px, đủ mượt
             t = (y - vanish_y) / (SCREEN_H - vanish_y)
             w = road_top_w + (road_bot_w - road_top_w) * t
             cx = SCREEN_W // 2 + self.drift * t * 0.3
-            left = int(cx - w)
-            right = int(cx + w)
+            edge_pts_left.append((int(cx - w), y))
+            edge_pts_right.append((int(cx + w), y))
 
-            pygame.draw.line(self.screen, ROAD_COLOR, (left, y), (right, y))
+        if len(edge_pts_left) > 1:
+            pygame.draw.lines(self.screen, LINE_WHITE, False, edge_pts_left, 2)
+            pygame.draw.lines(self.screen, LINE_WHITE, False, edge_pts_right, 2)
 
-            # Vạch giữa (nét đứt vàng)
-            line_offset = (y + int(self.road_offset * t)) % 40
-            if line_offset < 20 and t > 0.05:
+        # Vạch giữa (nét đứt vàng) – chỉ vẽ đoạn nét, không vẽ khoảng trống
+        for y in range(vanish_y + 10, SCREEN_H, 4):
+            t = (y - vanish_y) / (SCREEN_H - vanish_y)
+            cx = SCREEN_W // 2 + self.drift * t * 0.3
+            line_offset = (y + int(self.road_offset * t)) % DASH_CYCLE
+            if line_offset < DASH_CYCLE // 2:
                 lw = max(1, int(3 * t))
                 pygame.draw.line(self.screen, LINE_YELLOW,
                                  (int(cx) - lw, y), (int(cx) + lw, y))
 
-            # Vạch lề
-            if t > 0.05:
-                elw = max(1, int(2 * t))
-                pygame.draw.line(self.screen, LINE_WHITE, (left, y), (left + elw, y))
-                pygame.draw.line(self.screen, LINE_WHITE, (right - elw, y), (right, y))
-
-        # Cuộn đường theo speed
-        self.road_offset += self.vehicle.speed * 0.15
+        # Cuộn đường theo speed – wrap around để tránh overflow
+        self.road_offset = (self.road_offset + self.vehicle.speed * 0.15) % DASH_CYCLE
 
     def _draw_traffic(self):
         """Vẽ xe traffic."""
         vanish_y = SCREEN_H // 3
+        road_h = SCREEN_H - vanish_y
         for car in self.traffic:
             if car.y < vanish_y:
                 continue
-            t = (car.y - vanish_y) / (SCREEN_H - vanish_y)
+            t = (car.y - vanish_y) / road_h
             scale = 0.3 + 0.7 * t
             w = int(30 * scale)
             h = int(20 * scale)
             rect = pygame.Rect(int(car.x) - w // 2, int(car.y) - h // 2, w, h)
-            pygame.draw.rect(self.screen, car.color, rect, border_radius=max(1, int(4 * scale)))
+            pygame.draw.rect(self.screen, car.color, rect,
+                             border_radius=max(1, int(4 * scale)))
             # Kính xe
             rw = int(20 * scale)
             rh = int(8 * scale)
@@ -349,10 +352,9 @@ class DrivingSimulation:
 
         # Đèn trước
         for dx in [-24, 18]:
-            color = (255, 255, 100)
-            pygame.draw.circle(self.screen, color, (cx + dx + 3, cy - 18), 4)
+            pygame.draw.circle(self.screen, (255, 255, 100), (cx + dx + 3, cy - 18), 4)
 
-        # Đèn phanh (phía sau)
+        # Đèn phanh
         if self.vehicle.brake_light:
             flash = abs(math.sin(self.frame_count * 0.1))
             for dx in [-22, 20]:
@@ -372,11 +374,9 @@ class DrivingSimulation:
         center_x, center_y = 100, SCREEN_H - 90
         radius = 55
 
-        # Nền
         pygame.draw.circle(self.screen, GAUGE_BG, (center_x, center_y), radius)
         pygame.draw.circle(self.screen, (80, 80, 90), (center_x, center_y), radius, 3)
 
-        # Vạch chia
         for i in range(0, 9):
             angle = math.radians(225 - i * 270 / 8)
             x1 = center_x + int((radius - 12) * math.cos(angle))
@@ -385,14 +385,12 @@ class DrivingSimulation:
             y2 = center_y - int((radius - 4) * math.sin(angle))
             pygame.draw.line(self.screen, LINE_WHITE, (x1, y1), (x2, y2), 2)
 
-            # Số
             speed_val = i * 10
             txt = self.font_small.render(str(speed_val), True, (180, 180, 180))
             tx = center_x + int((radius - 22) * math.cos(angle)) - txt.get_width() // 2
             ty = center_y - int((radius - 22) * math.sin(angle)) - txt.get_height() // 2
             self.screen.blit(txt, (tx, ty))
 
-        # Kim
         speed_ratio = min(self.vehicle.speed / 80.0, 1.0)
         needle_angle = math.radians(225 - speed_ratio * 270)
         nx = center_x + int((radius - 18) * math.cos(needle_angle))
@@ -404,7 +402,6 @@ class DrivingSimulation:
         pygame.draw.line(self.screen, needle_color, (center_x, center_y), (nx, ny), 3)
         pygame.draw.circle(self.screen, LINE_WHITE, (center_x, center_y), 5)
 
-        # Số tốc độ
         speed_txt = self.font.render(f"{int(self.vehicle.speed)} km/h", True, LINE_WHITE)
         self.screen.blit(speed_txt,
                          (center_x - speed_txt.get_width() // 2, center_y + 20))
@@ -414,11 +411,9 @@ class DrivingSimulation:
         x, y = SCREEN_W - 60, SCREEN_H - 180
         w, h = 30, 150
 
-        # Nền
         pygame.draw.rect(self.screen, GAUGE_BG, (x - 2, y - 2, w + 4, h + 4),
                          border_radius=4)
 
-        # Thanh fill (xanh → vàng → đỏ)
         fill_h = int(h * self.attention_score / 100.0)
         if self.attention_score > 60:
             color = ALERT_GREEN
@@ -431,10 +426,8 @@ class DrivingSimulation:
             fill_rect = pygame.Rect(x, y + (h - fill_h), w, fill_h)
             pygame.draw.rect(self.screen, color, fill_rect, border_radius=2)
 
-        # Viền
         pygame.draw.rect(self.screen, (100, 100, 110), (x, y, w, h), 2, border_radius=4)
 
-        # Label
         label = self.font_small.render("ATT", True, LINE_WHITE)
         self.screen.blit(label, (x + w // 2 - label.get_width() // 2, y + h + 5))
         score_txt = self.font.render(f"{int(self.attention_score)}", True, color)
@@ -446,21 +439,17 @@ class DrivingSimulation:
         cx, cy = SCREEN_W - 100, 80
         r = 35
 
-        # Nền
         bg_surf = pygame.Surface((r * 2 + 10, r * 2 + 10), pygame.SRCALPHA)
         bg_surf.fill((0, 0, 0, 120))
         self.screen.blit(bg_surf, (cx - r - 5, cy - r - 5))
 
-        # Vòng tròn mặt
         pygame.draw.circle(self.screen, (180, 180, 180), (cx, cy), r, 2)
 
-        # Mũi tên hướng nhìn (dựa trên yaw, pitch)
         arrow_x = cx + int(self.head_yaw * 0.8)
         arrow_y = cy + int(self.head_pitch * 0.8)
         arrow_x = max(cx - r + 5, min(cx + r - 5, arrow_x))
         arrow_y = max(cy - r + 5, min(cy + r - 5, arrow_y))
 
-        # Dot hướng nhìn
         dot_color = ALERT_GREEN
         if abs(self.head_yaw) > 25 or abs(self.head_pitch) > 20:
             dot_color = ALERT_RED
@@ -469,24 +458,20 @@ class DrivingSimulation:
         pygame.draw.circle(self.screen, dot_color, (arrow_x, arrow_y), 6)
         pygame.draw.line(self.screen, dot_color, (cx, cy), (arrow_x, arrow_y), 2)
 
-        # Labels
         label = self.font_small.render("HEAD", True, LINE_WHITE)
         self.screen.blit(label, (cx - label.get_width() // 2, cy + r + 8))
 
-        # Roll indicator (nghiêng)
-        roll_txt = self.font_small.render(f"R:{int(self.head_roll)}°", True, (180, 180, 180))
+        roll_txt = self.font_small.render(f"R:{int(self.head_roll)}\u00b0", True, (180, 180, 180))
         self.screen.blit(roll_txt, (cx - roll_txt.get_width() // 2, cy - r - 18))
 
     def _draw_hud(self):
         """Vẽ HUD thông tin."""
-        # Panel nền
         hud_surface = pygame.Surface((240, 200), pygame.SRCALPHA)
         hud_surface.fill((0, 0, 0, 160))
         self.screen.blit(hud_surface, (10, 10))
 
         y_pos = 20
 
-        # Trạng thái monitoring
         if self.is_monitoring:
             status_color = ALERT_GREEN
             status_text = "MONITORING: ON"
@@ -496,7 +481,6 @@ class DrivingSimulation:
         self.screen.blit(self.font.render(status_text, True, status_color), (20, y_pos))
         y_pos += 30
 
-        # Drowsy level
         level_colors = [ALERT_GREEN, ALERT_YELLOW, ALERT_RED]
         level_names = ["Normal", "Warning", "DANGER!"]
         lv = min(self.drowsy_level, 2)
@@ -506,7 +490,6 @@ class DrivingSimulation:
         )
         y_pos += 30
 
-        # Attention score
         att_color = ALERT_GREEN if self.attention_score > 60 else (
             ALERT_YELLOW if self.attention_score > 30 else ALERT_RED)
         self.screen.blit(
@@ -515,7 +498,6 @@ class DrivingSimulation:
         )
         y_pos += 30
 
-        # Blink & Yawn
         self.screen.blit(
             self.font.render(f"Blinks: {self.blink_count}", True, LINE_WHITE),
             (20, y_pos)
@@ -527,7 +509,6 @@ class DrivingSimulation:
         )
         y_pos += 25
 
-        # Vehicle state
         v = self.vehicle
         brake_txt = f"Brake: {int(v.brake_force * 100)}%"
         brake_color = ALERT_RED if v.brake_force > 0.5 else (
@@ -551,7 +532,7 @@ class DrivingSimulation:
             border_color = (int(220 * flash), 0, 0)
             pygame.draw.rect(self.screen, border_color, (0, 0, SCREEN_W, SCREEN_H), 6)
 
-        # Lane departure warning (viền vàng)
+        # Lane departure warning
         if self.vehicle.lane_departure:
             flash = (self.frame_count // 10) % 2 == 0
             if flash:
