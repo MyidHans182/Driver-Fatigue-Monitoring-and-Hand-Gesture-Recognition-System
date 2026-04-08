@@ -1,8 +1,15 @@
 """
 Detect_Sleep.py  –  Hệ thống giám sát buồn ngủ tài xế + Mô phỏng lái xe.
-- Detect mắt (EAR cả 2 mắt) + ngáp (MAR)
-- Hand gesture điều khiển (angle-based + temporal smoothing cho ổn định)
+
+Tính năng:
+- EAR (Eye Aspect Ratio) cả 2 mắt – Soukupova & Cech 2016
+- MAR (Mouth Aspect Ratio) detect ngáp
+- Head Pose Estimation (pitch/yaw/roll) bằng solvePnP
+- Angle-based hand gesture + temporal smoothing
+- Driver Attention Score (composite 0-100)
 - Tích hợp driving simulation qua pygame
+- Data logging CSV
+- Âm thanh qua pygame.mixer (multi-channel)
 """
 import cv2
 import mediapipe as mp
@@ -14,6 +21,8 @@ import math
 import time as time_module
 import threading
 import collections
+import csv
+import datetime
 import numpy as np
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -31,61 +40,203 @@ class Config:
 
     # EAR (Eye Aspect Ratio)
     EAR_THRESHOLD: float = 35.0        # dưới ngưỡng này = nhắm mắt
-    EAR_SMOOTH_WINDOW: int = 5         # số frame trung bình hóa
-    BLINK_ALERT_COUNT: int = 30        # số blink liên tục → cảnh báo nhẹ
-    SLEEP_DANGER_COUNT: int = 6        # sleep counter → cảnh báo nặng
+    EAR_SMOOTH_WINDOW: int = 5
+    EYES_CLOSED_FRAMES: int = 3        # nhắm liên tục bao nhiêu frame → drowsy
+    EYES_DANGER_FRAMES: int = 15       # nhắm rất lâu → danger
 
     # MAR (Mouth Aspect Ratio)
-    MAR_THRESHOLD: float = 94.0        # trên ngưỡng này = đang ngáp
+    MAR_THRESHOLD: float = 94.0
     MAR_SMOOTH_WINDOW: int = 5
-    YAWN_ALERT_COUNT: int = 60         # yawn counter → cảnh báo dừng xe
+    YAWN_ALERT_COUNT: int = 60         # tổng yawn frames → cảnh báo
+    YAWN_DECAY_RATE: int = 30          # mỗi N frame không ngáp, giảm yawn 1
 
     # Hand gesture
-    GESTURE_HOLD_FRAMES: int = 15      # giữ gesture bao nhiêu frame mới kích hoạt
-    GESTURE_CONFIDENCE: float = 0.7    # ngưỡng confidence tay
-    GESTURE_SMOOTH_WINDOW: int = 7     # bao nhiêu frame gần nhất để vote gesture
+    GESTURE_HOLD_FRAMES: int = 15
+    GESTURE_CONFIDENCE: float = 0.7
+    GESTURE_SMOOTH_WINDOW: int = 7
 
-    # Thời gian reset
-    FRAME_RESET_CYCLE: int = 900       # reset blink counter mỗi N frame
+    # Blink tracking
+    BLINK_ALERT_COUNT: int = 30        # số blink → cảnh báo
+    BLINK_RESET_CYCLE: int = 900       # reset blink counter mỗi N frame
+
+    # Head pose
+    HEAD_PITCH_THRESHOLD: float = -15.0   # gật đầu
+    HEAD_YAW_THRESHOLD: float = 30.0      # quay đầu
+    HEAD_ROLL_THRESHOLD: float = 20.0     # nghiêng đầu
+
+    # Attention score weights
+    ATT_W_EYE: float = 0.35
+    ATT_W_MOUTH: float = 0.20
+    ATT_W_HEAD: float = 0.30
+    ATT_W_BLINK: float = 0.15
+
+    # Logging
+    LOG_ENABLED: bool = True
 
 CFG = Config()
 
 
 # ── Enum trạng thái ───────────────────────────────────────────────────────────
 class SystemState(Enum):
-    IDLE = auto()           # chờ gesture bật monitoring
-    MONITORING = auto()     # đang giám sát
-    MUSIC = auto()          # đang phát nhạc nền
+    IDLE = auto()
+    MONITORING = auto()
+    MUSIC = auto()
+
+class EyeState(Enum):
+    OPEN = auto()
+    CLOSED = auto()
 
 
-# ── Helper: phát âm thanh không blocking ──────────────────────────────────────
-def play_sound_async(filename, flags=None):
-    """Phát .wav trong thread riêng, không block video loop."""
-    def _play():
+# ── Sound Manager (pygame.mixer – multi-channel) ─────────────────────────────
+class SoundManager:
+    """Quản lý âm thanh qua pygame.mixer – channel riêng cho alert vs music."""
+
+    def __init__(self):
         try:
-            import winsound
-            if filename is None:
-                winsound.PlaySound(None, 0)
-                return
-            if os.path.exists(filename):
-                f = flags if flags is not None else winsound.SND_FILENAME
-                winsound.PlaySound(filename, f)
-            else:
-                print(f"[WARNING] Sound not found: {filename}")
+            import pygame.mixer
+            pygame.mixer.init()
+            self._alert_channel = pygame.mixer.Channel(0)
+            self._music_channel = pygame.mixer.Channel(1)
+            self._available = True
         except Exception as e:
-            print(f"[SOUND ERROR] {e}")
+            print(f"[SOUND] pygame.mixer init failed: {e}, falling back to silent")
+            self._available = False
 
-    threading.Thread(target=_play, daemon=True).start()
+        self._sound_cache: dict = {}
+        self.music_playing = False
+
+    def _load(self, filename):
+        """Load và cache sound file."""
+        if not self._available or not filename:
+            return None
+        if filename in self._sound_cache:
+            return self._sound_cache[filename]
+        if os.path.exists(filename):
+            import pygame.mixer
+            snd = pygame.mixer.Sound(filename)
+            self._sound_cache[filename] = snd
+            return snd
+        else:
+            print(f"[WARNING] Sound not found: {filename}")
+            return None
+
+    def play_alert(self, filename):
+        """Phát alert sound (channel 0) – không ảnh hưởng music."""
+        if not self._available:
+            return
+        snd = self._load(filename)
+        if snd:
+            self._alert_channel.play(snd)
+
+    def stop_alert(self):
+        """Dừng alert sound – KHÔNG dừng music."""
+        if self._available:
+            self._alert_channel.stop()
+
+    def play_music(self, filename):
+        """Phát nhạc nền (channel 1) – loop."""
+        if not self._available:
+            return
+        snd = self._load(filename)
+        if snd:
+            self._music_channel.play(snd, loops=-1)
+            self.music_playing = True
+
+    def stop_music(self):
+        """Dừng nhạc nền."""
+        if self._available:
+            self._music_channel.stop()
+        self.music_playing = False
+
+    def stop_all(self):
+        """Dừng tất cả."""
+        self.stop_alert()
+        self.stop_music()
 
 
-def stop_sound():
-    """Dừng mọi âm thanh."""
-    play_sound_async(None)
+# ── Head Pose Estimation ─────────────────────────────────────────────────────
+class HeadPoseEstimator:
+    """Ước lượng hướng đầu (pitch/yaw/roll) từ face mesh landmarks."""
+
+    # 3D model points (generic face model, mm)
+    MODEL_POINTS = np.array([
+        (0.0, 0.0, 0.0),             # Nose tip (1)
+        (0.0, -330.0, -65.0),        # Chin (199)
+        (-225.0, 170.0, -135.0),     # Left eye left corner (33)
+        (225.0, 170.0, -135.0),      # Right eye right corner (263)
+        (-150.0, -150.0, -125.0),    # Left mouth corner (61)
+        (150.0, -150.0, -125.0),     # Right mouth corner (291)
+    ], dtype=np.float64)
+
+    LANDMARK_IDS = [1, 199, 33, 263, 61, 291]
+
+    def __init__(self, img_w=640, img_h=480):
+        self.img_w = img_w
+        self.img_h = img_h
+        focal_length = img_w
+        center = (img_w / 2, img_h / 2)
+        self.camera_matrix = np.array([
+            [focal_length, 0, center[0]],
+            [0, focal_length, center[1]],
+            [0, 0, 1]
+        ], dtype=np.float64)
+        self.dist_coeffs = np.zeros((4, 1))
+
+        # Smoothing
+        self._pitch_buf = collections.deque(maxlen=5)
+        self._yaw_buf = collections.deque(maxlen=5)
+        self._roll_buf = collections.deque(maxlen=5)
+
+    def estimate(self, face_landmarks):
+        """
+        Tính pitch, yaw, roll từ face mesh landmarks.
+        face_landmarks: list of (x, y) tuples từ FaceMeshDetector.
+        Returns: (pitch, yaw, roll) in degrees, hoặc (0, 0, 0) nếu fail.
+        """
+        try:
+            image_points = np.array([
+                face_landmarks[lid] for lid in self.LANDMARK_IDS
+            ], dtype=np.float64)
+
+            # Chỉ lấy x, y (face mesh cho tuple (x, y))
+            if len(image_points[0]) > 2:
+                image_points = image_points[:, :2]
+
+            success, rotation_vec, translation_vec = cv2.solvePnP(
+                self.MODEL_POINTS, image_points,
+                self.camera_matrix, self.dist_coeffs,
+                flags=cv2.SOLVEPNP_ITERATIVE
+            )
+
+            if not success:
+                return 0.0, 0.0, 0.0
+
+            # Rotation matrix → Euler angles
+            rmat, _ = cv2.Rodrigues(rotation_vec)
+            angles, _, _, _, _, _ = cv2.RQDecomp3x3(rmat)
+
+            pitch = angles[0]
+            yaw = angles[1]
+            roll = angles[2]
+
+            # Smooth
+            self._pitch_buf.append(pitch)
+            self._yaw_buf.append(yaw)
+            self._roll_buf.append(roll)
+
+            smooth_pitch = sum(self._pitch_buf) / len(self._pitch_buf)
+            smooth_yaw = sum(self._yaw_buf) / len(self._yaw_buf)
+            smooth_roll = sum(self._roll_buf) / len(self._roll_buf)
+
+            return smooth_pitch, smooth_yaw, smooth_roll
+
+        except Exception:
+            return 0.0, 0.0, 0.0
 
 
-# ── Angle-based finger counting (thay thế fingersUp của cvzone) ──────────────
+# ── Angle-based finger counting ──────────────────────────────────────────────
 def _angle(a, b, c):
-    """Tính góc tại điểm b (độ), với a-b-c là 3 landmarks [x,y,z]."""
+    """Tính góc tại điểm b (độ)."""
     ba = np.array(a[:2]) - np.array(b[:2])
     bc = np.array(c[:2]) - np.array(b[:2])
     cos_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
@@ -93,30 +244,14 @@ def _angle(a, b, c):
 
 
 def count_fingers_angle(hand_data, angle_threshold=160):
-    """
-    Đếm số ngón tay đang giơ dựa trên góc giữa các đốt ngón.
-    Ổn định hơn fingersUp vì không phụ thuộc hướng tay (x/y).
-
-    Ngón duỗi thẳng → góc lớn (gần 180°).
-    Ngón gập        → góc nhỏ (< threshold).
-
-    MediaPipe hand landmarks:
-      Ngón cái:  1-2-3-4    (CMC-MCP-IP-TIP)
-      Ngón trỏ:  5-6-7-8    (MCP-PIP-DIP-TIP)
-      Ngón giữa: 9-10-11-12
-      Ngón áp út: 13-14-15-16
-      Ngón út:    17-18-19-20
-    """
+    """Đếm ngón tay bằng góc giữa các đốt (ổn định hơn fingersUp)."""
     lm = hand_data["lmList"]
     fingers = []
 
-    # Ngón cái: dùng góc tại MCP (landmark 2) và IP (landmark 3)
-    # Ngón cái cần ngưỡng thấp hơn vì phạm vi xoay khác
+    # Ngón cái
     thumb_angle = _angle(lm[1], lm[2], lm[3])
     thumb_tip_angle = _angle(lm[2], lm[3], lm[4])
-    # Cái duỗi khi cả 2 góc đều lớn
     thumb_open = thumb_angle > 140 and thumb_tip_angle > 140
-    # Thêm kiểm tra khoảng cách: tip phải xa wrist
     thumb_tip_dist = np.linalg.norm(np.array(lm[4][:2]) - np.array(lm[2][:2]))
     thumb_base_dist = np.linalg.norm(np.array(lm[3][:2]) - np.array(lm[2][:2]))
     if thumb_base_dist > 0:
@@ -125,17 +260,14 @@ def count_fingers_angle(hand_data, angle_threshold=160):
         thumb_extended = thumb_open
     fingers.append(1 if thumb_extended else 0)
 
-    # 4 ngón còn lại: góc tại PIP và DIP
+    # 4 ngón còn lại
     finger_joints = [
-        (5, 6, 7, 8),      # trỏ
-        (9, 10, 11, 12),    # giữa
-        (13, 14, 15, 16),   # áp út
-        (17, 18, 19, 20),   # út
+        (5, 6, 7, 8), (9, 10, 11, 12),
+        (13, 14, 15, 16), (17, 18, 19, 20),
     ]
-    for mcp, pip, dip, tip in finger_joints:
-        angle_pip = _angle(lm[mcp], lm[pip], lm[dip])
-        angle_dip = _angle(lm[pip], lm[dip], lm[tip])
-        # Ngón duỗi khi cả 2 góc đều lớn
+    for mcp, pip_, dip, tip in finger_joints:
+        angle_pip = _angle(lm[mcp], lm[pip_], lm[dip])
+        angle_dip = _angle(lm[pip_], lm[dip], lm[tip])
         is_open = angle_pip > angle_threshold and angle_dip > angle_threshold
         fingers.append(1 if is_open else 0)
 
@@ -144,20 +276,18 @@ def count_fingers_angle(hand_data, angle_threshold=160):
 
 # ── Gesture Smoother ──────────────────────────────────────────────────────────
 class GestureSmoother:
-    """Lọc gesture bằng majority vote trên N frame gần nhất."""
+    """Majority vote + hold-to-activate."""
 
     def __init__(self, window_size=7, hold_frames=15):
         self.history = collections.deque(maxlen=window_size)
         self.hold_frames = hold_frames
         self.current_gesture = 0
         self.hold_counter = 0
-        self.activated = False   # đã kích hoạt gesture chưa
+        self.activated = False
 
     def update(self, raw_finger_count):
-        """Cập nhật gesture mới. Trả về (stable_gesture, just_activated)."""
+        """Trả về (stable_gesture, just_activated)."""
         self.history.append(raw_finger_count)
-
-        # Majority vote
         if len(self.history) < 3:
             return 0, False
 
@@ -166,19 +296,16 @@ class GestureSmoother:
             counts[g] = counts.get(g, 0) + 1
         voted = max(counts, key=counts.get)
 
-        # Nếu gesture thay đổi → reset hold
         if voted != self.current_gesture:
             self.current_gesture = voted
             self.hold_counter = 0
             self.activated = False
             return voted, False
 
-        # Cùng gesture → tăng hold counter
         self.hold_counter += 1
-
         if self.hold_counter >= self.hold_frames and not self.activated:
             self.activated = True
-            return voted, True  # just activated!
+            return voted, True
 
         return voted, False
 
@@ -189,9 +316,105 @@ class GestureSmoother:
         self.activated = False
 
 
+# ── Driver Attention Score ────────────────────────────────────────────────────
+class AttentionScorer:
+    """Tính attention score tổng hợp 0-100."""
+
+    def __init__(self):
+        self._score = 100.0
+        self._blink_times = collections.deque(maxlen=60)  # timestamps of blinks
+
+    def record_blink(self):
+        """Ghi nhận 1 lần chớp mắt."""
+        self._blink_times.append(time_module.time())
+
+    def _blink_freq_score(self):
+        """Tần suất chớp mắt bình thường = 15-20/phút → score 100.
+        Quá nhiều (>30) hoặc quá ít (<5) → giảm."""
+        now = time_module.time()
+        recent = [t for t in self._blink_times if now - t < 60]
+        bpm = len(recent)
+
+        if 10 <= bpm <= 25:
+            return 100.0
+        elif bpm < 10:
+            return max(30, 100 - (10 - bpm) * 7)  # ít blink = buồn ngủ
+        else:
+            return max(30, 100 - (bpm - 25) * 5)   # nhiều blink = mệt
+
+    def compute(self, ear_avg, mar_avg, head_pitch, head_yaw, head_roll):
+        """
+        Tính attention score.
+        - ear_avg: EAR trung bình (0-50ish, cao = mở mắt)
+        - mar_avg: MAR trung bình (0-140ish, thấp = miệng đóng)
+        - head_pitch/yaw/roll: degrees
+        """
+        # Eye score: EAR > 35 = mắt mở (100), < 25 = nhắm (0)
+        eye_score = np.clip((ear_avg - 25) / 10 * 100, 0, 100)
+
+        # Mouth score: MAR < 60 = bình thường (100), > 94 = ngáp (0)
+        mouth_score = np.clip((94 - mar_avg) / 34 * 100, 0, 100)
+
+        # Head score: thẳng = 100, gật/nghiêng/quay = giảm
+        pitch_penalty = max(0, (-head_pitch - 10)) * 5  # gật xuống
+        yaw_penalty = max(0, abs(head_yaw) - 15) * 4    # quay sang bên
+        roll_penalty = max(0, abs(head_roll) - 10) * 3   # nghiêng
+        head_score = np.clip(100 - pitch_penalty - yaw_penalty - roll_penalty, 0, 100)
+
+        # Blink frequency
+        blink_score = self._blink_freq_score()
+
+        # Weighted sum
+        raw = (CFG.ATT_W_EYE * eye_score +
+               CFG.ATT_W_MOUTH * mouth_score +
+               CFG.ATT_W_HEAD * head_score +
+               CFG.ATT_W_BLINK * blink_score)
+
+        # Smooth (exponential moving average)
+        alpha = 0.15
+        self._score = alpha * raw + (1 - alpha) * self._score
+
+        return self._score
+
+
+# ── Data Logger ───────────────────────────────────────────────────────────────
+class DataLogger:
+    """Log metrics mỗi frame vào CSV."""
+
+    HEADERS = [
+        "timestamp", "ear_left", "ear_right", "ear_avg", "mar",
+        "head_pitch", "head_yaw", "head_roll",
+        "attention_score", "drowsy_level", "blink_count", "yawn_count",
+        "vehicle_speed", "lane_offset", "system_state",
+    ]
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self._file = None
+        self._writer = None
+        if enabled:
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"session_{ts}.csv"
+            self._file = open(filename, "w", newline="", encoding="utf-8")
+            self._writer = csv.writer(self._file)
+            self._writer.writerow(self.HEADERS)
+            print(f"[LOG] Logging to {filename}")
+
+    def log(self, **kwargs):
+        if not self.enabled or not self._writer:
+            return
+        row = [kwargs.get(h, "") for h in self.HEADERS]
+        row[0] = datetime.datetime.now().isoformat()
+        self._writer.writerow(row)
+
+    def close(self):
+        if self._file:
+            self._file.close()
+
+
 # ── Hệ thống chính ───────────────────────────────────────────────────────────
 def Start():
-    # Khởi tạo detector
+    # Khởi tạo detectors
     faceDetector = FaceMeshDetector(maxFaces=1)
     handDetector = HandDetector(detectionCon=CFG.GESTURE_CONFIDENCE, maxHands=1)
 
@@ -206,22 +429,39 @@ def Start():
     # Driving simulation
     sim = DrivingSimulation()
 
-    # Landmark IDs
-    # Mắt trái: 6 điểm theo công thức EAR (Soukupova & Cech 2016)
-    LEFT_EYE  = {"top1": 159, "bot1": 145, "top2": 158, "bot2": 153, "left": 133, "right": 33}
-    RIGHT_EYE = {"top1": 386, "bot1": 374, "top2": 385, "bot2": 380, "left": 362, "right": 263}
-    # Vẽ mắt
+    # Sound manager (dùng pygame.mixer – multi-channel)
+    sound = SoundManager()
+
+    # Head pose estimator
+    head_pose = HeadPoseEstimator(640, 480)
+
+    # Attention scorer
+    attention = AttentionScorer()
+
+    # Data logger
+    logger = DataLogger(enabled=CFG.LOG_ENABLED)
+
+    # Landmark IDs – EAR (Soukupova & Cech 2016)
+    LEFT_EYE = {
+        "top1": 159, "bot1": 145, "top2": 158, "bot2": 153,
+        "left": 133, "right": 33
+    }
+    RIGHT_EYE = {
+        "top1": 386, "bot1": 374, "top2": 385, "bot2": 380,
+        "left": 362, "right": 263
+    }
     idListEye = [22, 23, 24, 26, 110, 157, 158, 159, 160, 161, 130, 243,
                  253, 254, 256, 339, 384, 385, 386, 387, 388, 359, 463]
     idListMouth = [185, 39, 37, 0, 267, 269, 325, 321, 404, 315, 16, 85, 180, 90]
 
-    # Plot
-    ploty_Eye   = LivePlot(640, 360, [20, 50],  invert=True)
+    # Plots
+    ploty_Eye = LivePlot(640, 360, [20, 50], invert=True)
     ploty_Mouth = LivePlot(640, 360, [30, 140], invert=True)
-    ploty_Time  = LivePlot(640, 360, [-2, 8],   invert=True)
+    ploty_Attention = LivePlot(640, 360, [0, 100], invert=True)
 
     # Trạng thái
     state = SystemState.IDLE
+    eye_state = EyeState.OPEN
     gesture_smoother = GestureSmoother(
         window_size=CFG.GESTURE_SMOOTH_WINDOW,
         hold_frames=CFG.GESTURE_HOLD_FRAMES
@@ -229,19 +469,32 @@ def Start():
 
     ratioList_Eye = collections.deque(maxlen=CFG.EAR_SMOOTH_WINDOW)
     ratioList_Mouth = collections.deque(maxlen=CFG.MAR_SMOOTH_WINDOW)
-    blinkCounter = 0
-    time_sleep_Counter = 0
-    counter = 0
-    color = (0, 0, 255)
-    yawn = 0
+
+    # Counters
+    blink_count = 0
+    eyes_closed_frames = 0       # liên tục nhắm mắt bao nhiêu frame
+    yawn_frames = 0              # tổng frames đang ngáp
+    yawn_no_yawn_counter = 0     # đếm frame không ngáp (cho decay)
     frame_count = 0
-    music_playing = False
+
+    # Drowsy level
+    drowsy_level = 0
+
+    # Current metrics (cho logging)
+    cur_ear_left = 0.0
+    cur_ear_right = 0.0
+    cur_ear_avg = 0.0
+    cur_mar = 0.0
+    cur_pitch = 0.0
+    cur_yaw = 0.0
+    cur_roll = 0.0
+    cur_attention = 100.0
 
     # FPS tracking
     prev_time = time_module.time()
 
     # Phát âm thanh khởi động
-    play_sound_async('start.wav')
+    sound.play_alert('start.wav')
 
     while True:
         success, img = cap.read()
@@ -254,52 +507,42 @@ def Start():
         fps = 1.0 / max(curr_time - prev_time, 0.001)
         prev_time = curr_time
 
-        # ── HAND DETECTION (mỗi frame) ──
+        # ── HAND DETECTION ──
         hands, img = handDetector.findHands(img, draw=True)
 
         if hands:
             hand = hands[0]
-            # Dùng angle-based counting thay vì cvzone fingersUp
             fingers = count_fingers_angle(hand)
             raw_count = fingers.count(1)
-
             stable_gesture, just_activated = gesture_smoother.update(raw_count)
 
-            # Hiển thị gesture (ổn định)
             gesture_color = (0, 255, 0) if just_activated else (255, 255, 0)
             cvzone.putTextRect(img, f'Gesture: {stable_gesture}', (0, 50),
                                scale=2, thickness=2, colorR=gesture_color)
 
-            # Xử lý gesture chỉ khi mới kích hoạt (hold đủ lâu)
             if just_activated:
                 if stable_gesture == 1:
-                    play_sound_async('eyes-start.wav')
+                    sound.play_alert('eyes-start.wav')
                     state = SystemState.MONITORING
                     sim.update_fatigue_state(alert_msg="MONITORING STARTED")
                 elif stable_gesture == 2:
-                    play_sound_async('goodbye.wav')
+                    sound.play_alert('goodbye.wav')
                     state = SystemState.IDLE
+                    drowsy_level = 0
+                    eyes_closed_frames = 0
                     sim.update_fatigue_state(0, 0, 0, False, "MONITORING STOPPED")
-                elif stable_gesture == 3 and not music_playing:
-                    play_sound_async('music_escape.wav')
-                    try:
-                        import winsound
-                        play_sound_async('music.wav', winsound.SND_FILENAME | winsound.SND_ASYNC)
-                    except ImportError:
-                        pass
-                    music_playing = True
+                elif stable_gesture == 3 and not sound.music_playing:
+                    sound.play_alert('music_escape.wav')
+                    sound.play_music('music.wav')
                     if state == SystemState.IDLE:
                         state = SystemState.MONITORING
-                elif stable_gesture == 5 and music_playing:
-                    stop_sound()
-                    music_playing = False
+                elif stable_gesture == 5 and sound.music_playing:
+                    sound.stop_music()
         else:
-            gesture_smoother.update(0)  # không thấy tay → vote 0
+            gesture_smoother.update(0)
 
         # ── FACE DETECTION ──
         _, faces = faceDetector.findFaceMesh(img, draw=False)
-
-        drowsy_level = 0  # cho simulation
 
         if state in (SystemState.MONITORING, SystemState.MUSIC):
             if faces:
@@ -308,9 +551,9 @@ def Start():
                 # Vẽ landmarks mắt
                 for fid in idListEye:
                     if fid < len(face):
-                        cv2.circle(img, face[fid], 3, color, cv2.FILLED)
+                        cv2.circle(img, face[fid], 3, (255, 0, 255), cv2.FILLED)
 
-                # ── EAR cả 2 mắt (Soukupova & Cech 2016) ──
+                # ── EAR cả 2 mắt ──
                 def calc_ear(eye_ids):
                     top1 = face[eye_ids["top1"]]
                     bot1 = face[eye_ids["bot1"]]
@@ -320,118 +563,193 @@ def Start():
                     right = face[eye_ids["right"]]
                     v1, _ = faceDetector.findDistance(top1, bot1)
                     v2, _ = faceDetector.findDistance(top2, bot2)
-                    h,  _ = faceDetector.findDistance(left, right)
+                    h, _ = faceDetector.findDistance(left, right)
                     if h == 0:
-                        return 50  # tránh chia 0
+                        return 50
                     return int(((v1 + v2) / (2.0 * h)) * 100)
 
-                ear_left = calc_ear(LEFT_EYE)
-                ear_right = calc_ear(RIGHT_EYE)
-                ear_avg = (ear_left + ear_right) / 2.0
+                cur_ear_left = calc_ear(LEFT_EYE)
+                cur_ear_right = calc_ear(RIGHT_EYE)
+                cur_ear_avg = (cur_ear_left + cur_ear_right) / 2.0
 
-                # Vẽ đường EAR mắt trái (cho trực quan)
+                ratioList_Eye.append(cur_ear_avg)
+                ear_smooth = sum(ratioList_Eye) / len(ratioList_Eye)
+
+                # Vẽ đường EAR mắt trái
                 leftUp = face[159]; leftDown = face[23]
                 leftLeft = face[130]; leftRight = face[243]
                 cv2.line(img, leftUp, leftDown, (100, 200, 100), 2)
                 cv2.line(img, leftLeft, leftRight, (100, 200, 100), 2)
 
-                ratioList_Eye.append(ear_avg)
-                ratioAvg_Eye = sum(ratioList_Eye) / len(ratioList_Eye)
+                # ── Eye State Machine (fix bug counter cooldown) ──
+                if ear_smooth < CFG.EAR_THRESHOLD:
+                    # Mắt nhắm
+                    if eye_state == EyeState.OPEN:
+                        # Transition: OPEN → CLOSED
+                        eye_state = EyeState.CLOSED
+                        blink_count += 1
+                        attention.record_blink()
 
-                # Phát hiện nhắm mắt
-                if ratioAvg_Eye < CFG.EAR_THRESHOLD and counter == 0:
-                    time_sleep_Counter += 1
-                    blinkCounter += 1
-                    if blinkCounter > CFG.BLINK_ALERT_COUNT:
-                        play_sound_async('sleepy.wav')
-                        blinkCounter = 0
-                    if time_sleep_Counter >= CFG.SLEEP_DANGER_COUNT:
-                        play_sound_async('warning.wav')
+                    eyes_closed_frames += 1
+
+                    # Cảnh báo theo mức
+                    if eyes_closed_frames >= CFG.EYES_DANGER_FRAMES:
                         drowsy_level = 2
-                        sim.update_fatigue_state(2, int(yawn / 20), blinkCounter, True,
-                                                 "WAKE UP! DANGER!")
-                    elif time_sleep_Counter >= 3:
+                        sound.play_alert('warning.wav')
+                    elif eyes_closed_frames >= CFG.EYES_CLOSED_FRAMES:
                         drowsy_level = 1
-                        sim.update_fatigue_state(1, int(yawn / 20), blinkCounter, True,
-                                                 "DROWSY WARNING!")
-                    else:
-                        stop_sound()
-                    color = (100, 200, 100)
-                    counter = 1
-                elif ratioAvg_Eye >= CFG.EAR_THRESHOLD and counter == 0:
-                    time_sleep_Counter = 0
-                    stop_sound()
-                    drowsy_level = 0
-                    sim.update_fatigue_state(0, int(yawn / 20), blinkCounter, True)
-
-                if counter != 0:
-                    counter += 1
-                    if counter > 10:
-                        counter = 0
-                        color = (255, 0, 255)
-
-                if frame_count > CFG.FRAME_RESET_CYCLE:
-                    blinkCounter = 0
-                    frame_count = 0
-
-                cvzone.putTextRect(img, f'Sleep: {time_sleep_Counter}', (0, 100),
-                                   scale=2, thickness=2, colorR=color)
-                cvzone.putTextRect(img, f'Blink: {blinkCounter}', (0, 150),
-                                   scale=2, thickness=2, colorR=color)
-
-                # ── Miệng (MAR) ──
-                for fid in idListMouth:
-                    cv2.circle(img, face[fid], 3, color, cv2.FILLED)
-
-                MouthUp   = face[0];   MouthDown  = face[16]
-                MouthLeft = face[185]; MouthRight = face[325]
-                lenghtVerMouth, _ = faceDetector.findDistance(MouthUp, MouthDown)
-                lenghtHorMouth, _ = faceDetector.findDistance(MouthLeft, MouthRight)
-
-                if lenghtHorMouth > 0:
-                    ratioMouth = int((lenghtVerMouth / lenghtHorMouth) * 100)
+                        sound.play_alert('sleepy.wav')
                 else:
-                    ratioMouth = 0
-                ratioList_Mouth.append(ratioMouth)
-                ratioAvg_Mouth = sum(ratioList_Mouth) / len(ratioList_Mouth)
+                    # Mắt mở
+                    if eye_state == EyeState.CLOSED:
+                        eye_state = EyeState.OPEN
+                        # Chỉ dừng alert, KHÔNG dừng music
+                        sound.stop_alert()
 
-                if ratioAvg_Mouth > CFG.MAR_THRESHOLD:
-                    yawn += 1
-                    time_sleep_Counter = 0
+                    eyes_closed_frames = 0
+                    drowsy_level = 0
 
-                if yawn > CFG.YAWN_ALERT_COUNT:
-                    play_sound_async('sleepy_stop_car.wav')
-                    sim.update_fatigue_state(2, int(yawn / 20), blinkCounter, True,
-                                             "TOO MANY YAWNS! STOP!")
-                    yawn = 0
+                # Blink count reset mỗi chu kỳ
+                if frame_count > 0 and frame_count % CFG.BLINK_RESET_CYCLE == 0:
+                    blink_count = 0
 
-                cvzone.putTextRect(img, f'Yawn: {int(yawn / 20)}', (0, 200),
-                                   scale=2, thickness=2, colorR=color)
+                # ── MAR (Miệng) ──
+                for fid in idListMouth:
+                    if fid < len(face):
+                        cv2.circle(img, face[fid], 3, (255, 0, 255), cv2.FILLED)
 
-                # Plot
-                imgPlotEye   = ploty_Eye.update(ratioAvg_Eye, (255, 0, 0))
-                imgPlotMouth = ploty_Mouth.update(ratioAvg_Mouth, (0, 255, 0))
-                imgPlotTime  = ploty_Time.update(time_sleep_Counter, (0, 0, 255))
+                MouthUp = face[0]; MouthDown = face[16]
+                MouthLeft = face[185]; MouthRight = face[325]
+                lenghtVer, _ = faceDetector.findDistance(MouthUp, MouthDown)
+                lenghtHor, _ = faceDetector.findDistance(MouthLeft, MouthRight)
+
+                cur_mar = int((lenghtVer / max(lenghtHor, 1)) * 100)
+                ratioList_Mouth.append(cur_mar)
+                mar_smooth = sum(ratioList_Mouth) / len(ratioList_Mouth)
+
+                if mar_smooth > CFG.MAR_THRESHOLD:
+                    yawn_frames += 1
+                    yawn_no_yawn_counter = 0
+                else:
+                    # Yawn decay
+                    yawn_no_yawn_counter += 1
+                    if yawn_no_yawn_counter >= CFG.YAWN_DECAY_RATE and yawn_frames > 0:
+                        yawn_frames -= 1
+                        yawn_no_yawn_counter = 0
+
+                if yawn_frames > CFG.YAWN_ALERT_COUNT:
+                    sound.play_alert('sleepy_stop_car.wav')
+                    drowsy_level = max(drowsy_level, 2)
+                    yawn_frames = 0
+
+                # ── Head Pose Estimation ──
+                cur_pitch, cur_yaw, cur_roll = head_pose.estimate(face)
+
+                # Head pose ảnh hưởng drowsy level
+                head_nodding = cur_pitch < CFG.HEAD_PITCH_THRESHOLD
+                head_distracted = abs(cur_yaw) > CFG.HEAD_YAW_THRESHOLD
+                head_leaning = abs(cur_roll) > CFG.HEAD_ROLL_THRESHOLD
+
+                if head_nodding:
+                    drowsy_level = max(drowsy_level, 1)
+                if head_leaning:
+                    drowsy_level = max(drowsy_level, 1)
+
+                # ── Attention Score ──
+                cur_attention = attention.compute(
+                    ear_smooth, mar_smooth,
+                    cur_pitch, cur_yaw, cur_roll
+                )
+
+                # ── HUD text ──
+                status_color = (0, 255, 0) if drowsy_level == 0 else (
+                    (255, 200, 0) if drowsy_level == 1 else (0, 0, 255))
+
+                cvzone.putTextRect(img, f'EAR: {int(ear_smooth)}', (0, 100),
+                                   scale=2, thickness=2, colorR=status_color)
+                cvzone.putTextRect(img, f'Blink: {blink_count}', (0, 150),
+                                   scale=2, thickness=2, colorR=status_color)
+                cvzone.putTextRect(img, f'Yawn: {yawn_frames // 20}', (0, 200),
+                                   scale=2, thickness=2, colorR=status_color)
+                cvzone.putTextRect(img, f'ATT: {int(cur_attention)}%', (0, 250),
+                                   scale=2, thickness=2, colorR=status_color)
+
+                # Head pose text
+                pose_txt = f'P:{int(cur_pitch)} Y:{int(cur_yaw)} R:{int(cur_roll)}'
+                cvzone.putTextRect(img, pose_txt, (350, 50),
+                                   scale=1.5, thickness=2, colorR=(200, 200, 200))
+
+                if head_nodding:
+                    cvzone.putTextRect(img, 'NODDING!', (350, 100),
+                                       scale=2, thickness=2, colorR=(0, 0, 255))
+                if head_distracted:
+                    cvzone.putTextRect(img, 'DISTRACTED!', (350, 150),
+                                       scale=2, thickness=2, colorR=(0, 0, 255))
+
+                # ── Update simulation ──
+                alert_msg = ""
+                if drowsy_level == 2:
+                    alert_msg = "DANGER! WAKE UP!"
+                elif drowsy_level == 1:
+                    alert_msg = "WARNING: DROWSY"
+                elif head_distracted:
+                    alert_msg = "LOOK AT THE ROAD!"
+
+                sim.update_fatigue_state(
+                    drowsy_level=drowsy_level,
+                    yawn_count=yawn_frames // 20,
+                    blink_count=blink_count,
+                    is_monitoring=True,
+                    alert_msg=alert_msg,
+                    attention_score=cur_attention,
+                    head_pitch=cur_pitch,
+                    head_yaw=cur_yaw,
+                    head_roll=cur_roll,
+                )
+
+                # Plots
+                imgPlotEye = ploty_Eye.update(ear_smooth, (255, 0, 0))
+                imgPlotMouth = ploty_Mouth.update(mar_smooth, (0, 255, 0))
+                imgPlotAtt = ploty_Attention.update(cur_attention, (0, 200, 255))
                 img = cv2.resize(img, (CFG.DISPLAY_W, CFG.DISPLAY_H))
-                imgStack = cvzone.stackImages([img, imgPlotEye, imgPlotMouth, imgPlotTime], 2, 1)
+                imgStack = cvzone.stackImages(
+                    [img, imgPlotEye, imgPlotMouth, imgPlotAtt], 2, 1)
+
+                # ── Log ──
+                vehicle_state = sim.get_vehicle_state()
+                logger.log(
+                    ear_left=cur_ear_left, ear_right=cur_ear_right,
+                    ear_avg=cur_ear_avg, mar=cur_mar,
+                    head_pitch=round(cur_pitch, 1),
+                    head_yaw=round(cur_yaw, 1),
+                    head_roll=round(cur_roll, 1),
+                    attention_score=round(cur_attention, 1),
+                    drowsy_level=drowsy_level,
+                    blink_count=blink_count,
+                    yawn_count=yawn_frames // 20,
+                    vehicle_speed=vehicle_state["speed_kmh"],
+                    lane_offset=vehicle_state["lane_offset_px"],
+                    system_state=state.name,
+                )
+
             else:
                 # Không thấy mặt
                 img = cv2.resize(img, (CFG.DISPLAY_W, CFG.DISPLAY_H))
                 imgStack = cvzone.stackImages([img], 1, 1)
-                sim.update_fatigue_state(0, int(yawn / 20), blinkCounter, True, "NO FACE DETECTED")
+                sim.update_fatigue_state(
+                    0, yawn_frames // 20, blink_count, True,
+                    "NO FACE DETECTED", cur_attention,
+                )
         else:
-            # IDLE – chỉ hiện camera
+            # IDLE
             img = cv2.resize(img, (CFG.DISPLAY_W, CFG.DISPLAY_H))
             imgStack = cvzone.stackImages([img], 1, 1)
-            sim.update_fatigue_state(0, 0, 0, False)
+            sim.update_fatigue_state(0, 0, 0, False, "", 100.0)
 
-        # FPS overlay
+        # FPS + State overlay
         cv2.putText(imgStack, f'FPS: {int(fps)}', (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-        # State overlay
-        state_text = f'State: {state.name}'
-        cv2.putText(imgStack, state_text, (10, 60),
+        cv2.putText(imgStack, f'State: {state.name}', (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         frame_count += 1
@@ -444,9 +762,12 @@ def Start():
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
+    # Cleanup
+    logger.close()
     cap.release()
     cv2.destroyAllWindows()
     sim.quit()
+    sound.stop_all()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
